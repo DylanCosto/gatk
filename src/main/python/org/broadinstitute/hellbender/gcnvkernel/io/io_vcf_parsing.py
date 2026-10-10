@@ -1,91 +1,62 @@
 import logging
+from bisect import bisect_left
+from itertools import chain
 import vcf
 from typing import List, Tuple
 
 _logger = logging.getLogger(__name__)
 
 
-# TODO: for now I'm going to do the lazy thing and just traverse the VCF each time for each sample
 def read_sample_segments_and_calls(intervals_vcf: str,
                                    clustered_vcf: str,
                                    sample_name: str,
                                    contig: str) -> List[Tuple[int, int, int]]:
-    """
-    Get the segmentation "path" to use for calculating qualities based on the VCF with clustered breakpoints
-    :param intervals_vcf:
-    :param clustered_vcf:
-    :param sample_name:
-    :param contig:
-    :return: {copy number, start index, stop index (inclusive)}
+    """Get (copy number, start index, inclusive end index) for clustered segments.
+
+    Modeling intervals must have nondecreasing starts and ends. Clustered
+    segments may overlap or be nested, so their end indices need not increase.
     """
     intervals = vcf.Reader(filename=intervals_vcf)
-    intervals2 = vcf.Reader(filename=intervals_vcf)
     segments = vcf.Reader(filename=clustered_vcf)
-
-    path: List[Tuple[int, int, int]] = []
-    segment_start_index = 0
-    segment_end_index = 0
-
-    # A record corresponds to [CHROM,POS,REF,ALT]
-    try:
-        interval_start_iter = iter(intervals.fetch(contig))
-        interval_end_iter = iter(intervals2.fetch(contig))
-    except ValueError:
-        print('ERROR: could not fetch intervals')
-        raise
-    else:
-        start_interval = next(interval_start_iter)
-        end_interval = next(interval_end_iter)
-        intervals_copy_number = try_getting_format_attribute(end_interval, sample_name, 'CN')
 
     try:
         segments_iter = iter(segments.fetch(contig))
     except ValueError:
-        return path
-    else:
-        segments_rec = next(segments_iter)
-        segment_copy_number = try_getting_format_attribute(segments_rec, sample_name, 'CN')
+        return []
+    first_segment = next(segments_iter, None)
+    if first_segment is None:
+        return []
 
-    # we assume segments are sorted by start, but may be overlapping
-    while segments_rec is not None and start_interval is not None:
-        # make sure interval start matches
-        while start_interval is not None and start_interval.POS < segments_rec.POS:
-            try:
-                start_interval = next(interval_start_iter)
-                segment_start_index += 1
-                end_interval = next(interval_end_iter)
-                segment_end_index += 1
-            except StopIteration:
-                print('ERROR: ran out of intervals with unmatched segments remaining')
-                raise
-        # once start matches, move the interval end
-        while end_interval is not None and try_getting_info_attribute(segments_rec, 'END') > \
-                try_getting_info_attribute(end_interval, 'END'):
-            try:
-                end_interval = next(interval_end_iter)
-                segment_end_index += 1
-                intervals_copy_number = try_getting_format_attribute(end_interval, sample_name, 'CN')
-            except StopIteration:
-                print('WARN: ran out of intervals with segment end unmatched')
-                end_interval = None
+    # Keep only coordinates: retaining parsed VCF records also retains every
+    # sample's FORMAT data. Each interval is parsed once per contig.
+    interval_starts: List[int] = []
+    interval_ends: List[int] = []
+    for interval in intervals.fetch(contig):
+        start = interval.POS
+        end = try_getting_info_attribute(interval, 'END')
+        if interval_starts and (start < interval_starts[-1] or end < interval_ends[-1]):
+            raise ValueError("Modeling interval starts and ends must be sorted on contig " + contig)
+        interval_starts.append(start)
+        interval_ends.append(end)
+    if not interval_starts:
+        raise StopIteration("No modeling intervals on contig " + contig)
 
-        # add the segment
+    path: List[Tuple[int, int, int]] = []
+    for segment in chain((first_segment,), segments_iter):
+        segment_start_index = bisect_left(interval_starts, segment.POS)
+        if segment_start_index == len(interval_starts):
+            raise StopIteration("Ran out of intervals with unmatched segments remaining")
+        segment_end_index = bisect_left(interval_ends, try_getting_info_attribute(segment, 'END'))
+        if segment_end_index == len(interval_ends):
+            # Preserve the previous behavior for a segment extending past the
+            # last modeled interval: use the last available interval.
+            _logger.warning("Ran out of intervals with segment end unmatched")
+            segment_end_index -= 1
         if segment_end_index < segment_start_index:
-            print('Sample {0} contains segment at {1}:{2} with end index greater than start index'.format(sample_name, contig, segments_rec.POS))
+            _logger.warning("Sample %s contains segment at %s:%s with end index less than start index",
+                            sample_name, contig, segment.POS)
+        segment_copy_number = try_getting_format_attribute(segment, sample_name, 'CN')
         path.append((segment_copy_number, segment_start_index, segment_end_index))
-        # do this the dumb way because each reader gets the same iterator
-        segment_end_index = 0
-        interval_end_iter = iter(intervals2.fetch(contig))
-        end_interval = next(interval_end_iter)
-
-        # get the next segment
-        try:
-            segments_rec = next(segments_iter)
-            segment_copy_number = try_getting_format_attribute(segments_rec, sample_name, 'CN')
-        except StopIteration:
-            segments_rec = None
-            segments_iter = None
-
     return path
 
 
